@@ -208,3 +208,96 @@ int 0x80
 ![image-20230414174534940](./README.assets/image-20230414174534940.png)
 
 缓冲区buf2位于0x0804A080，在区间0x804a000~0x804b000内，这个区间的内存的信息显示在第三行，可以读写，但是不能执行。原来是自从Linux内核5.x之后，内存的BSS段默认没有可执行权限。
+
+想要解决这个问题，需要使用`mprotect()`函数来改写BSS段的权限：
+
+```c
+#include <unistd.h>
+#include <sys/mman.h>
+
+int mprotect(const void* start, size_t len, int prot)
+```
+
+参数含义如下：
+
+* start：目标内存页的起始地址
+* len：目标内存的长度，需要是内存页大小的整数倍
+* prot：保护属性，有四种：可读、可写、可执行、不可访问
+
+因为有三个参数，所以在构造负载的时候需要用到已经存在于程序代码中的“pop pop pop ret”序列：
+
+![image-20230414183114277](./README.assets/image-20230414183114277.png)
+
+可以看到在0x0804862d这里存在合适的代码片段。
+
+然后就是找到mprotect的入口了：
+
+```python
+elf = ELF("./ret2shellcode")
+for k, v in elf.symbols.items():
+    print(f"{k}: {v}")
+```
+
+```
+stdout: 134520928
+_IO_stdin_used: 134514268
+stdin: 134520896
+: 134520896
+__JCR_LIST__: 134520592
+deregister_tm_clones: 134513776
+register_tm_clones: 134513824
+__do_global_dtors_aux: 134513888
+completed.6591: 134520932
+__do_global_dtors_aux_fini_array_entry: 134520588
+frame_dummy: 134513920
+__frame_dummy_init_array_entry: 134520584
+__FRAME_END__: 134514532
+__JCR_END__: 134520592
+__init_array_end: 134520588
+_DYNAMIC: 134520596
+__init_array_start: 134520584
+_GLOBAL_OFFSET_TABLE_: 134520832
+__libc_csu_fini: 134514240
+__x86.get_pc_thunk.bx: 134513760
+data_start: 134520872
+_edata: 134520880
+_fini: 134514244
+buf2: 134520960
+__data_start: 134520872
+__dso_handle: 134520876
+__libc_csu_init: 134514128
+stdin@@GLIBC_2.0: 134520896
+_end: 134521060
+_start: 134513712
+_fp_hw: 134514264
+stdout@@GLIBC_2.0: 134520928
+__bss_start: 134520880
+main: 134513965
+__TMC_END__: 134520880
+_init: 134513540
+printf: 134513600
+plt.printf: 134513600
+gets: 134513616
+plt.gets: 134513616
+puts: 134513632
+plt.puts: 134513632
+__gmon_start__: 134513648
+plt.__gmon_start__: 134513648
+__libc_start_main: 134513664
+plt.__libc_start_main: 134513664
+setvbuf: 134513680
+plt.setvbuf: 134513680
+strncpy: 134513696
+plt.strncpy: 134513696
+got.__gmon_start__: 134520856
+got.stdin: 134520896
+got.stdout: 134520928
+got.printf: 134520844
+got.gets: 134520848
+got.puts: 134520852
+got.__libc_start_main: 134520860
+got.setvbuf: 134520864
+got.strncpy: 134520868
+```
+
+然后发现程序中不存在mprotect...寄。但是程序动态链接了`libc.so.6`且存在puts()函数，应该可以通过定位libc来达成目标。
